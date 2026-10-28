@@ -8,14 +8,99 @@ const TERMS=[];for(let y=2025;y<=2042;y++){TERMS.push(`Jan ${y}`,`May ${y}`,`Jul
 const DAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const NAV=[['dashboard','◫','Dashboard'],['planner','▦','Semester Planner'],['roadmap','♧','Degree Roadmap'],['catalogue','▤','Course Catalogue'],['grades','◈','Grades & Assessments'],['settings','⚙','Settings & Imports']];
 const baseCatalogue=Object.fromEntries(SEED.catalogue.map(c=>[c.code,c]));
+
+// --- SUPABASE CONFIGURATION ---
+const SUPABASE_URL = 'https://glfeeqrrmkkdbvujnvga.supabase.co'; // Replace with your Supabase Project URL
+const SUPABASE_ANON_KEY = 'sb_publishable_jhs_j49D6kXIYTLOUk-N9w_jGzPCKpg'; // Replace with your Supabase anon public key
+const supabaseClient = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+let currentUser = null;
+
 let state=load(KEY,{focus:'Jan 2027',targets:{'Jan 2027':15},records:{},choices:{},blocks:{},plans:{},future:{},scores:{},allowTG:false,manualCourses:{}});
 let imports=load(IMPORTKEY,{schedule:{},metadata:{},importLog:[]});
 let view='dashboard',tab='courses',selectedPlan='A',catalogueQuery='',catFilter='degree',statusFilter='all',activeCourse=null,stagedImport=null,courseScope='confirmed';
 function $(id){return document.getElementById(id)}
 function esc(a){return String(a??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function fmt(v){return Number(v||0).toLocaleString('en-SG',{maximumFractionDigits:1})}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(state));localStorage.setItem(IMPORTKEY,JSON.stringify(imports))}catch(e){toast('Browser storage is full. Export a backup; large new schedule imports may need a browser storage upgrade.')}}
+
+// Modified save and load to support Supabase Cloud Sync
+async function save(){
+  try{
+    localStorage.setItem(KEY,JSON.stringify(state));
+    localStorage.setItem(IMPORTKEY,JSON.stringify(imports));
+  }catch(e){
+    toast('Browser storage is full. Export a backup; large new schedule imports may need a browser storage upgrade.');
+  }
+  if(currentUser && supabaseClient){
+    try{
+      await supabaseClient.from('user_profiles').upsert({
+        id: currentUser.id,
+        planner_state: state,
+        updated_at: new Date().toISOString()
+      });
+    }catch(err){
+      console.error('Cloud sync failed:', err);
+    }
+  }
+}
+
 function load(k,def){try{const x=JSON.parse(localStorage.getItem(k));return x&&typeof x==='object'?x:def}catch(e){return def}}
+
+async function initCloudSync(){
+  if(!supabaseClient) return;
+  const { data: { session } } = await supabaseClient.auth.getSession();
+  currentUser = session?.user ?? null;
+  updateAuthUI();
+  if(currentUser){
+    try{
+      let { data, error } = await supabaseClient
+        .from('user_profiles')
+        .select('planner_state')
+        .eq('id', currentUser.id)
+        .single();
+      if(data && data.planner_state){
+        state = data.planner_state;
+        purgeStalePlans();
+        render();
+      }
+    }catch(e){
+      console.error('Could not fetch cloud state:', e);
+    }
+  }
+
+  supabaseClient.auth.onAuthStateChange(async (_event, session) => {
+    currentUser = session?.user ?? null;
+    updateAuthUI();
+    if(currentUser){
+      let { data } = await supabaseClient
+        .from('user_profiles')
+        .select('planner_state')
+        .eq('id', currentUser.id)
+        .single();
+      if(data && data.planner_state){
+        state = data.planner_state;
+        purgeStalePlans();
+        render();
+      }
+    }
+  });
+}
+
+function updateAuthUI() {
+  const authBtn = $('authBtn');
+  const authStatus = $('authStatus');
+  if (authBtn && authStatus) {
+    if (currentUser) {
+      authBtn.textContent = 'Sign Out';
+      authStatus.textContent = `● Logged in`;
+      authStatus.style.color = '#367855';
+    } else {
+      authBtn.textContent = 'Sign In';
+      authStatus.textContent = '● Offline mode';
+      authStatus.style.color = '#788b7e';
+    }
+  }
+}
+
 function toast(m){$('toast').textContent=m;$('toast').classList.add('show');clearTimeout(window._toast);window._toast=setTimeout(()=>$('toast').classList.remove('show'),4000)}
 function catalogue(){return {...baseCatalogue,...imports.metadata,...state.manualCourses}}
 function course(code){return state.manualCourses[code]||imports.metadata[code]||baseCatalogue[code]||{code,name:code,cat:'unassigned',cu:0,prereq:'',offerings:[]}}
@@ -108,7 +193,7 @@ function sameCoursesAlternative(term,primary){
 function generatePlans(term){let a=planBuild(term,'A'),b=sameCoursesAlternative(term,a)||planBuild(term,'B',a.courses),c=planBuild(term,'C',[],new Set(a.courses.filter(x=>x.priority==='suggested').map(x=>x.code)));let out={A:a,B:b,C:c};if(a.courses.map(x=>x.code).sort().join('|')!==b.courses.map(x=>x.code).sort().join('|'))b.notes.push('Could not retain every Plan A course with alternative CRNs. Plan B contains only compatible courses; no substitutions were made.');if(planSignature(a)===planSignature(b))b.notes.push('No distinct alternative CRN combination was found with these constraints.');if(planSignature(a)===planSignature(c))c.notes.push('No distinct alternative course combination was found under the current constraints.');return out}
 function snapshotPlan(p){return {variant:p.variant,courses:p.courses,cu:p.cu,notes:p.notes,soft:p.soft,travel:p.travel,verified:p.verified,created:new Date().toISOString()}}
 function chosenEvents(term){let selections=state.plans[term]?.approved?.courses||picked(term).map(x=>({code:x.code,group:x.group}));return selections.flatMap(p=>groupSessions(term,p.code,p.group||Object.keys(groupsFor(term,p.code))[0]))}
-function warningsForEvents(events,term){let overlaps=eventConflicts(events,events).filter(([a,b])=>a.c!==b.c);let dedup=[...new Set(overlaps.map(([a,b])=>`${datePretty(a.d)}: ${a.c} ${a.g} and ${b.c} ${b.g} (${clock(Math.max(a.s,b.s))}–${clock(Math.min(a.e,b.e))})`))];return [...dedup,...clashBlock(events,term).filter(x=>x.block.kind==='hard').map(x=>`${x.event.c}: hard-blocked ${datePretty(x.event.d)}`)]}
+function warningsForEvents(events,term){let overlaps=eventConflicts(events,events).filter(([a,b])=>a.c!==b.c);let dedup=[...new Set(overlaps.map(([a,b])=>`${datePretty(a.d)}: ${a.c} ${a.g} and ${b.c} ${b.g} (${clock(Math.max(a.s,b.s))}–${clock(Math.min(a.e,b.e))})`))];return [...dedup,...clashBlock(events,term).filter(x=>x.block.kind==='hard മറ്റൊരു'||x.block.kind==='hard').map(x=>`${x.event.c}: hard-blocked ${datePretty(x.event.d)}`)]}
 function nav(){ $('nav').innerHTML=NAV.map(([id,icon,name])=>`<button class="navbtn ${view===id?'active':''}" data-view="${id}"><span class="ni">${icon}</span>${name}</button>`).join('');$('crumb').textContent=NAV.find(x=>x[0]===view)?.[2]||'Dashboard';$('sidebarCUs').textContent=`${fmt(earnedTotal())} / ${TOTAL} CU`;$('sidebarMeter').style.width=(100*earnedTotal()/TOTAL)+'%'}
 function head(eyebrow,title,subtitle,button=''){return `<div class="headline"><div><div class="eyebrow">${esc(eyebrow)}</div><h1>${esc(title)}</h1><p class="subhead">${esc(subtitle)}</p></div>${button}</div>`}
 function render(){nav();$('content').innerHTML=({dashboard:dashboard,planner:planner,roadmap:roadmap,catalogue:courseCatalogue,grades:grades,settings:settings})[view]();}
@@ -132,16 +217,13 @@ function planner(){let term=state.focus,off=optionsFor(term);
  return head('COURSE REGISTRATION',niceTerm(term),'Choose courses and let the app find compatible actual-date timetables.',`<button class="btn small outline" data-view="settings">↑ Import schedule</button>`)+`<div class="toolbar"><label class="fieldlabel">Semester<select id="focusTerm">${chooserOptions()}</select></label><label class="fieldlabel">Target CU<input id="targetCu" type="number" value="${termTarget(term)}" min="2.5" max="40" step="2.5"></label><span class="pill ${no?'warn':'ok'}">${no?'No exact schedule imported':Object.keys(off).length+' courses in full schedule'}</span><span class="spacer"></span><button class="btn" id="generate">✧ Generate Plans A, B & C</button></div>${no?'<div class="note warning">Exact timetable not imported for this semester. The unscheduled list is for tentative planning only; verified clash-free registration plans require a full schedule.</div>':''}${currentlyStudying.length?`<div class="note" style="margin-bottom:15px"><strong>Already studying — excluded from new registration suggestions:</strong> ${currentlyStudying.map(c=>esc(c.code)+(record(c.code).term?' ('+esc(record(c.code).term)+')':'')).join(' · ')}. These courses remain in the Course Catalogue and Grades pages.</div>`:''}<div class="tabs">${[['courses','Course Selection'],['calendar','Dated Calendar'],['plans','Plans A / B / C']].map(([v,n])=>`<button class="tab ${tab===v?'active':''}" data-tab="${v}">${n}</button>`).join('')}</div>${tab==='courses'?`<div class="two"><section class="card"><div class="card-title"><h2>My shortlisted courses</h2><span class="pill">${picked(term).length} selected</span></div>${selected.length?`<div class="list">${selected.map(c=>chosenPicker(c,term)).join('')}</div>`:'<div class="empty">Choose courses from the lists on the right. Set Must Take, Preferred or Backup.</div>'}<p class="footer">"Must Take" choices are protected as far as a valid timetable allows. You can specify a preferred CRN or let the planner decide.</p></section><section class="card"><div class="card-title"><h2>Degree course options</h2><span class="pill">${availableCourses.length} scheduled · ${otherCourses.length} unscheduled</span></div><input class="field search" id="semesterSearch" placeholder="Search all degree courses, including PAR301…" style="width:100%;margin-bottom:12px"><div class="tabs" style="margin-bottom:13px"><button class="tab ${courseScope==='confirmed'?'active':''}" data-course-scope="confirmed">Confirmed CRNs · ${availableCourses.length}</button><button class="tab ${courseScope==='unscheduled'?'active':''}" data-course-scope="unscheduled">No confirmed CRN · ${otherCourses.length}</button></div><div id="availableList" style="max-height:620px;overflow:auto"><div class="listing-group" id="confirmedCourses" ${courseScope==='confirmed'?'':'style="display:none"'}><h3>Confirmed in ${esc(niceTerm(term))} timetable <span class="pill ok">${availableCourses.length}</span></h3><div class="list">${availableCourses.map(c=>chosenPicker(c,term)).join('')||'<div class="empty">No confirmed courses match.</div>'}</div></div><div class="listing-group" id="unscheduledCourses" ${courseScope==='unscheduled'?'':'style="display:none"'}><h3>Other degree courses — no confirmed CRN <span class="pill warn">${otherCourses.length}</span></h3><p class="subhead" style="margin:6px 0 13px">Including MNPER options such as PAR301. You may mark them as tentative priorities, but they will not appear in a clash-checked registration plan until the semester timetable confirms a CRN.</p><div class="list">${otherCourses.map(c=>chosenPicker(c,term)).join('')||'<div class="empty">All degree courses have a confirmed timetable.</div>'}</div></div></div><p class="footer">Already in-progress or successfully completed courses are excluded from these lists. Unclassified courses remain in the Course Catalogue for review.</p></section></div>`:tab==='calendar'?renderCalendar(term):renderPlans(term)}`}
 function renderCalendar(term){let ev=chosenEvents(term);let warn=warningsForEvents(ev,term);const by={};for(const e of ev){by[e.d]??=[];by[e.d].push(e)}const dates=Object.keys(by).sort();return `<section class="card"><div class="card-title"><h2>Actual dated sessions</h2><span class="pill">${ev.length} sessions</span></div><div class="note">Showing approved Plan A/B/C when available, otherwise your shortlisted preferred CRNs. Classes on the same weekday are allowed if their actual dates and times don't overlap.</div>${warn.map(w=>`<div class="note error">${esc(w)}</div>`).join('')}<div class="table-wrap" style="margin-top:15px"><table><thead><tr><th>Date</th><th>Course / Group</th><th>Class type</th><th>Time</th><th>Campus</th></tr></thead><tbody>${dates.slice(0,150).flatMap(d=>by[d].sort((a,b)=>a.s-b.s).map(e=>`<tr><td>${esc(datePretty(d))}</td><td>${esc(e.c)} · ${esc(e.g)}</td><td>${esc(e.m)}</td><td>${clock(e.s)}–${clock(e.e)}</td><td>${esc(e.v)}</td></tr>`)).join('')||'<tr><td colspan="5">No CRNs selected yet.</td></tr>'}</tbody></table></div>${dates.length>150?'<p class="footer">Showing the first 150 session dates for readability.</p>':''}</section>`}
 function renderPlans(term){const obj=state.plans[term],list=obj?.generated||{};let selected=list[selectedPlan];return `<section class="card"><div class="card-title"><h2>Automatically generated plans</h2>${obj?.updated?`<span class="tiny">Generated ${esc(new Date(obj.updated).toLocaleString('en-SG'))}</span>`:''}</div><div class="note">Plans are ranked by your priority tiers, eligibility, actual class/lab/exam dates, semester CU target, personal restrictions, then assessment workload. Seat availability is never guaranteed.</div><div class="tabs" style="margin-top:16px">${[['A','Plan A · Preferred'],['B','Plan B · Other CRNs'],['C','Plan C · Backup courses']].map(([a,b])=>`<button class="tab ${selectedPlan===a?'active':''}" data-plan="${a}">${b}</button>`).join('')}</div>${selected?`<div class="plan ${selectedPlan==='A'?'top':''}"><div class="title-row"><h2>Plan ${selectedPlan}</h2><span class="pill ${selected.verified?'ok':'warn'}">${selected.verified?'Sessions checked':'Needs review'}</span></div><div class="mini-stats" style="margin-top:12px"><span><strong>${fmt(selected.cu)} CU</strong> / ${fmt(termTarget(term))} target</span><span><strong>${selected.courses.length}</strong> courses</span><span><strong>${selected.soft}</strong> flexible-block overlaps</span><span><strong>${selected.travel}</strong> travel warnings</span></div><div class="plan-list">${selected.courses.map(c=>`<div class="plan-course"><span><strong>${esc(c.code)}</strong> · ${esc(course(c.code).name)} <small class="muted">(${esc(c.priority)})</small></span><span class="no-wrap"><strong>${esc(c.group)}</strong> · ${fmt(c.cu)} CU</span></div>`).join('')||'<div class="empty">No eligible courses could be scheduled.</div>'}</div>${selected.notes.map(n=>`<div class="note warning">${esc(n)}</div>`).join('')}${selected.soft?'<div class="note warning">Some sessions overlap your flexible preferences. Check before approving.</div>':''}${selected.travel?'<div class="note warning">One or more back-to-back campus changes may need more travel time.</div>':''}<div class="toolbar" style="margin:18px 0 0"><button class="btn" data-approve="${selectedPlan}" ${!selected.courses.length?'disabled':''}>✓ Approve Plan ${selectedPlan}</button><button class="btn outline" data-copyplan="${selectedPlan}">Copy CRN checklist</button><button class="btn light" data-view="planner" data-tab="calendar">View sessions →</button></div></div>`:'<div class="empty" style="margin-top:16px">Your generated plans will appear here. Select courses then click “Generate Plans A, B & C”.</div>'}${obj?.approved?`<div class="note">Approved: Plan ${esc(obj.approved.variant)}, ${fmt(obj.approved.cu)} CU. Remember this is a personal plan, not an SUSS registration.</div>`:''}</section>`}
-function canForecastTake(c,t,done){const p=c.prereq||'';let codes=[...new Set(p.match(/(?:BME|NIE|NCO|MTH|ENG)\d{3}/g)||[])];if(/90\s*CU/i.test(p))return done.filter(code=>course(code).cat!=='suss_comp'&&course(code).cat!=='suss_people'&&course(code).cat!=='suss_engage').reduce((a,code)=>a+(course(code).cu||0),0)>=90;if(/programme dependent/i.test(p))return true;return codes.every(code=>done.includes(code))}
+function canForecastTake(c,t,done){const p=c.prereq||'';let codes=[...new Set(p.match(/(?:BME|NIE|NCO|MTH|ENG)\d{3}/g) || [])];if(/90\s*CU/i.test(p))return done.filter(code=>course(code).cat!=='suss_comp'&&course(code).cat!=='suss_people'&&course(code).cat!=='suss_engage').reduce((a,code)=>a+(course(code).cu||0),0)>=90;if(/programme dependent/i.test(p))return true;return codes.every(code=>done.includes(code))}
 function likelyOffered(c,t){if(available(t,c.code))return true;if((c.offerings||[]).includes(t))return true;let yy=Number(t.slice(-4)),month=t.slice(0,3);if(yy<=2028&&c.offerings?.length)return false;let p=(c.pattern||'').toUpperCase();if(p.includes('EVERY JAN'))return month==='Jan';if(p.includes('EVERY JUL'))return month==='Jul';if(p.includes('ALL SEMESTERS'))return true;if(p.includes('EVERY REGULAR'))return month!=='May';if(month==='May')return false;let o=c.offerings||[];let j=o.some(x=>x.startsWith('Jan')),l=o.some(x=>x.startsWith('Jul'));if(j&&!l)return month==='Jan';if(l&&!j)return month==='Jul';return true}
 function simulate(target){
- // Forecast only: assume ongoing courses will eventually pass, without adding
- // their CU to the official progress tracker or re-scheduling the same course.
  let ongoing=Object.values(catalogue()).filter(c=>REQ[c.cat]&&c.cu>0&&record(c.code).status==='inprogress');
  let done=[...new Set([...Object.values(catalogue()).filter(earned).map(x=>x.code),...ongoing.map(x=>x.code)])];
  let left=Object.fromEntries(REQUIREMENTS.map(r=>[r[0],Math.max(0,catLeft(r[0])-ongoing.filter(c=>c.cat===r[0]).reduce((sum,c)=>sum+Number(c.cu),0))]));let start=Math.max(TERMS.indexOf('Jan 2027'),TERMS.indexOf(state.focus));if(start<0)start=TERMS.indexOf('Jan 2027');let details=[];let end='';let deferred={};
  for(let i=start;i<TERMS.length;i++){let term=TERMS[i];if(term.startsWith('May')&&!Object.keys(state.future[term]||{}).length)continue;let limit=Number(state.targets[term]||target),used=0,entries=[];let cands=Object.values(catalogue()).filter(c=>REQ[c.cat]&&c.cu>0&&!done.includes(c.code)&&left[c.cat]>=c.cu&&likelyOffered(c,term)&&canForecastTake(c,term,done));cands.sort((a,b)=>(state.future[term]?.[b.code]?1:0)-(state.future[term]?.[a.code]?1:0)||left[b.cat]-left[a.cat]||a.code.localeCompare(b.code));for(let c of cands){if(used+c.cu>limit||left[c.cat]<c.cu)continue;if(c.cat==='mnper_core'&&['PAR307','PAR309'].includes(c.code)&&[...done,...entries].some(x=>['PAR307','PAR309'].includes(x)))continue;used+=Number(c.cu);left[c.cat]-=Number(c.cu);entries.push(c.code)}
- // The general-elective basket may have no chosen titles yet. Treat its remaining CU as a labelled forecast placeholder, never as a registered course.
  if(!term.startsWith('May')){while(left.general>0&&used+2.5<=limit){let step=Math.min(5,left.general,limit-used);if(step<2.5)break;used+=step;left.general-=step;entries.push('General Elective (TBD) '+fmt(step)+' CU');}}
  done.push(...entries.filter(c=>!c.includes(' (TBD) ')));details.push({term,cu:used,courses:entries});if(Object.values(left).every(x=>x<=0)){end=term;break}if(i>TERMS.indexOf('Jan 2040'))break}
  return {end,details,left}}
@@ -173,6 +255,7 @@ function acceptImport(){const s=stagedImport;if(!s)return;for(let [term,sc] of O
 function copyPlan(k){let p=state.plans[state.focus]?.generated?.[k];if(!p)return;let text=`SUSS ${state.focus} Plan ${k} (${fmt(p.cu)} CU)\n`+p.courses.map(c=>`${c.code} | ${c.group} | ${fmt(c.cu)} CU | ${course(c.code).name}`).join('\n')+'\n\nPersonal plan only. Confirm all course restrictions and seats at SUSS eCR.';if(navigator.clipboard?.writeText)navigator.clipboard.writeText(text).then(()=>toast('CRN checklist copied.'),()=>{window.prompt('Copy this plan:',text)});else window.prompt('Copy this plan:',text)}
 function minInput(v){return Number(v.slice(0,2))*60+Number(v.slice(3,5))}
 function exportPlanApproval(k){let p=state.plans[state.focus]?.generated?.[k];if(!p||!p.courses.length)return;state.plans[state.focus].approved=snapshotPlan(p);save();render();toast(`Plan ${k} saved as your current approved registration plan.`)}
+
 $('backupQuick').onclick=doExport;
 $('menuButton').onclick=()=>{$('sidebar').classList.toggle('open')};
 $('closeModal').onclick=closeModal;
@@ -180,7 +263,28 @@ $('modalBack').onclick=e=>{if(e.target===$('modalBack'))closeModal()};
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
 $('pdfInput').addEventListener('change',async e=>{await startImport(e.target.files?.[0]);e.target.value=''});
 $('restoreInput').addEventListener('change',async e=>{await restoreFile(e.target.files?.[0]);e.target.value=''});
-document.addEventListener('click',e=>{
+
+document.addEventListener('click',async e=>{
+ let authBtn = e.target.closest('#authBtn');
+ if(authBtn){
+   if(currentUser){
+     if(supabaseClient){
+       await supabaseClient.auth.signOut();
+       toast('Signed out successfully.');
+       render();
+     }
+   } else {
+     let email = prompt('Enter your email to sign in / sign up:');
+     if(!email) return;
+     if(supabaseClient){
+       let { error } = await supabaseClient.auth.signInWithOtp({ email });
+       if(error) toast('Error: ' + error.message);
+       else toast('Check your email for the magic link login!');
+     }
+   }
+   return;
+ }
+
  let b=e.target.closest('[data-view]');if(b){view=b.dataset.view;if(b.dataset.tab)tab=b.dataset.tab;render();$('sidebar').classList.remove('open');return}
  b=e.target.closest('[data-tab]');if(b){tab=b.dataset.tab;render();return}
  b=e.target.closest('[data-plan]');if(b){selectedPlan=b.dataset.plan;render();return}
@@ -198,7 +302,7 @@ document.addEventListener('click',e=>{
   const was=record(code);
   const changed=JSON.stringify(was)!==JSON.stringify(nextRecord)||nextCourse.cat!==previous.cat||nextCourse.cu!==previous.cu||nextCourse.prereq!==previous.prereq;
   state.manualCourses[code]=nextCourse;state.records[code]=nextRecord;
-  if(changed)state.plans={}; // Old generated/approved registration plans must be recalculated after academic changes.
+  if(changed)state.plans={}; 
   save();closeModal();render();toast(`${code} saved.${changed?' Registration plans must be regenerated.':''}`);return}
  if(e.target.id==='saveScores'){const code=activeCourse;if(!code)return;state.scores[code]??={};$('modalInner').querySelectorAll('[data-score]').forEach(el=>{if(el.value==='')delete state.scores[code][el.dataset.score];else{let n=Number(el.value);if(n>=0&&n<=100)state.scores[code][el.dataset.score]=n}});save();courseModal(code);toast('Assessment scores saved.');return}
  if(e.target.id==='addCourse'){simpleAddCourse();return}
@@ -211,6 +315,7 @@ document.addEventListener('click',e=>{
  if(e.target.id==='postpone'){let code=$('postponeCourse').value,term=$('postponeTerm').value;if(!likelyOffered(course(code),term)){if(!confirm(`${code} is not shown as an expected presentation in ${term}. Save this tentative move anyway?`))return;}state.future[term]??={};state.future[term][code]=true;save();render();toast('Future course placement saved as tentative.');return}
  if(e.target.id==='addBlock'){let time1=$('blockStart').value,time2=$('blockEnd').value;if(!time1||!time2||minInput(time1)>=minInput(time2))return toast('End time must be later than start time.');let isdate=$('blockRepeat').value==='date',date=$('blockDate').value;if(isdate&&!date)return toast('Choose a specific date.');state.blocks[state.focus]??=[];state.blocks[state.focus].push({kind:$('blockKind').value,date:isdate?date:'',day:isdate?'':$('blockDay').value,start:minInput(time1),end:minInput(time2),reason:$('blockReason').value});invalidatePlan(state.focus);render();toast('Personal timetable restriction added.');return}
 });
+
 document.addEventListener('change',e=>{
  let el=e.target;
  if(el.dataset.choice){updateChoice(el.dataset.choice,'priority',el.value);return}
@@ -222,6 +327,7 @@ document.addEventListener('change',e=>{
  if(el.id==='allowTG'){state.allowTG=el.checked;invalidatePlan(state.focus);render();return}
  if(el.id==='blockRepeat'){$('blockDateLabel').style.display=el.value==='date'?'grid':'none';$('blockDayLabel').style.display=el.value==='date'?'none':'grid';return}
 });
+
 document.addEventListener('input',e=>{
  if(e.target.id==='catalogueSearch'){catalogueQuery=e.target.value;const start=e.target.selectionStart;render();let el=$('catalogueSearch');el.focus();el.setSelectionRange(start,start);return}
  if(e.target.id==='semesterSearch'){
@@ -235,7 +341,9 @@ document.addEventListener('input',e=>{
   const activeSearchScope=q?(hits.unscheduled&&!hits.confirmed?'unscheduled':hits.confirmed&&!hits.unscheduled?'confirmed':null):courseScope;
   document.querySelectorAll('[data-course-scope]').forEach(t=>t.classList.toggle('active',t.dataset.courseScope===activeSearchScope));
   return}
-
 });
+
 purgeStalePlans();
-render();
+initCloudSync().then(() => {
+  render();
+});
