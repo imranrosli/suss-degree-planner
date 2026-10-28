@@ -91,7 +91,8 @@ function updateAuthUI() {
   if (authBtn && authStatus) {
     if (currentUser) {
       authBtn.textContent = 'Sign Out';
-      authStatus.textContent = `● Logged in`;
+      // Shows your exact email address so you know it's your account
+      authStatus.textContent = `● Logged in (${currentUser.email})`;
       authStatus.style.color = '#367855';
     } else {
       authBtn.textContent = 'Sign In';
